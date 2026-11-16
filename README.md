@@ -7,6 +7,12 @@ A local-first subscription and bill tracker: see your monthly burn and never get
 
 RenewalRadar tracks every recurring charge in one place: streaming, SaaS, utilities, insurance, domains, the gym. It shows what you actually spend per month once weekly, quarterly, and yearly bills are normalized, what is about to renew, and every charge coming in the next 90 days. There is no account and no server. Everything runs in your browser and your data never leaves your device.
 
+**Live demo:** https://renewalradar-phi.vercel.app: click "Load demo data" to explore it with fictional items.
+
+![RenewalRadar dashboard showing demo data](docs/dashboard.png)
+
+*The screenshot above is the real app running with the built-in fictional demo data.*
+
 ## Features
 
 - Add, edit, and delete items with a name, amount, currency (INR, USD, EUR, GBP), billing cycle (weekly, monthly, quarterly, half-yearly, yearly, one-time), category, next renewal date, an optional payment label such as the card that gets charged, optional notes, and an active or paused status.
