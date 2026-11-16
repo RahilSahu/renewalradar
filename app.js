@@ -2,8 +2,10 @@
  * RenewalRadar UI.
  *
  * All state lives in localStorage under Core.STORAGE_KEY. Nothing is
- * sent anywhere. All math is delegated to core.js (window.RenewalCore)
- * so the UI and the tests share one implementation.
+ * sent anywhere: statement files are read with the File API and parsed
+ * on this device, and the calendar file is generated as a Blob. All
+ * math is delegated to core.js (window.RenewalCore) so the UI and the
+ * tests share one implementation.
  */
 (function () {
   'use strict';
@@ -38,6 +40,13 @@
   var searchQuery = '';
   var breakdownCurrency = null;
   var bannerTimer = null;
+  var renewTargetId = null;
+  var pendingProposals = [];
+  var expandedHistory = {};
+  var priceNotes = {};
+  var reduceMotion =
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   function $(id) {
     return document.getElementById(id);
@@ -72,6 +81,66 @@
     if (entry.daysLeft === 0) return 'Today';
     if (entry.daysLeft === 1) return 'Tomorrow';
     return 'in ' + entry.daysLeft + 'd';
+  }
+
+  function monogram(item, sizeClass) {
+    var tile = el('span', 'monogram' + (sizeClass ? ' ' + sizeClass : ''));
+    var letter = (item.name || '?').trim().charAt(0).toUpperCase() || '?';
+    tile.textContent = letter;
+    tile.style.background = Core.categoryColor(item.category);
+    tile.setAttribute('aria-hidden', 'true');
+    return tile;
+  }
+
+  /* ---------------- count-up animation ---------------- */
+
+  // Animate a money figure from 0 to its target over about 650 ms.
+  // With prefers-reduced-motion, or when the browser has no
+  // requestAnimationFrame, the final value is set immediately.
+  function animateMoney(node, target, currency) {
+    if (node._animFrame) window.cancelAnimationFrame(node._animFrame);
+    if (reduceMotion || typeof window.requestAnimationFrame !== 'function') {
+      node.textContent = fmtMoney(target, currency);
+      return;
+    }
+    var start = null;
+    var duration = 650;
+    function frame(ts) {
+      if (start == null) start = ts;
+      var t = Math.min(1, (ts - start) / duration);
+      var eased = 1 - Math.pow(1 - t, 3);
+      node.textContent = fmtMoney(target * eased, currency);
+      if (t < 1) {
+        node._animFrame = window.requestAnimationFrame(frame);
+      } else {
+        node.textContent = fmtMoney(target, currency);
+        node._animFrame = null;
+      }
+    }
+    node._animFrame = window.requestAnimationFrame(frame);
+  }
+
+  function animateCount(node, target) {
+    if (node._animFrame) window.cancelAnimationFrame(node._animFrame);
+    if (reduceMotion || typeof window.requestAnimationFrame !== 'function') {
+      node.textContent = String(target);
+      return;
+    }
+    var start = null;
+    var duration = 650;
+    function frame(ts) {
+      if (start == null) start = ts;
+      var t = Math.min(1, (ts - start) / duration);
+      var eased = 1 - Math.pow(1 - t, 3);
+      node.textContent = String(Math.round(target * eased));
+      if (t < 1) {
+        node._animFrame = window.requestAnimationFrame(frame);
+      } else {
+        node.textContent = String(target);
+        node._animFrame = null;
+      }
+    }
+    node._animFrame = window.requestAnimationFrame(frame);
   }
 
   /* ---------------- storage ---------------- */
@@ -121,7 +190,7 @@
     if (isSuccess) {
       bannerTimer = window.setTimeout(function () {
         banner.hidden = true;
-      }, 5000);
+      }, 6000);
     }
   }
 
@@ -129,35 +198,145 @@
     $('banner').hidden = true;
   }
 
-  /* ---------------- rendering ---------------- */
+  /* ---------------- hero and stats ---------------- */
 
-  function statLines(container, byCurrency, key) {
+  function renderHero(today) {
+    var totals = Core.computeTotals(items, today);
+    var box = $('heroMonthly');
+    box.textContent = '';
+    var currencies = Object.keys(totals.byCurrency).sort();
+    if (!currencies.length) {
+      var zero = el('div', 'hero-line');
+      var zeroAmt = el('span', 'hero-amount', '0');
+      zero.appendChild(zeroAmt);
+      box.appendChild(zero);
+    }
+    currencies.forEach(function (cur) {
+      var line = el('div', 'hero-line');
+      var amt = el('span', 'hero-amount');
+      line.appendChild(amt);
+      line.appendChild(el('span', 'hero-cur', cur + ' / month'));
+      box.appendChild(line);
+      animateMoney(amt, totals.byCurrency[cur].monthly, cur);
+    });
+
+    var spot = $('heroSpotlight');
+    spot.textContent = '';
+    var entries = Core.renewingSoon(items, today);
+    if (!entries.length) {
+      spot.appendChild(el('p', 'spot-none', 'Nothing is due soon. Enjoy the quiet.'));
+      return;
+    }
+    var next = entries[0];
+    var card = el('div', 'spot-card');
+    card.appendChild(monogram(next.item, 'monogram-lg'));
+    var main = el('div', 'spot-main');
+    main.appendChild(el('div', 'spot-name', next.item.name));
+    main.appendChild(
+      el('div', 'spot-meta', fmtDate(next.date) + ' · ' + next.item.category)
+    );
+    card.appendChild(main);
+    var side = el('div', 'spot-side');
+    side.appendChild(el('div', 'spot-amount', fmtMoney(next.item.amount, next.item.currency)));
+    side.appendChild(el('span', 'badge badge-' + next.badge, badgeText(next)));
+    card.appendChild(side);
+    spot.appendChild(card);
+  }
+
+  function statLines(container, byCurrency, key, animate) {
     container.textContent = '';
     var currencies = Object.keys(byCurrency);
     if (!currencies.length) {
-      container.appendChild(el('div', 'stat-line', ''));
-      container.firstChild.appendChild(el('span', 'stat-amount', '0'));
+      var line = el('div', 'stat-line');
+      line.appendChild(el('span', 'stat-amount', '0'));
+      container.appendChild(line);
       return;
     }
     currencies.sort().forEach(function (cur) {
       var line = el('div', 'stat-line');
-      line.appendChild(el('span', 'stat-amount', fmtMoney(byCurrency[cur][key], cur)));
+      var amt = el('span', 'stat-amount');
+      line.appendChild(amt);
       line.appendChild(el('span', 'stat-cur', cur));
       container.appendChild(line);
+      if (animate) animateMoney(amt, byCurrency[cur][key], cur);
+      else amt.textContent = fmtMoney(byCurrency[cur][key], cur);
     });
   }
 
   function renderStats(today) {
     var totals = Core.computeTotals(items, today);
-    statLines($('statMonthly'), totals.byCurrency, 'monthly');
-    statLines($('statYearly'), totals.byCurrency, 'yearly');
-    statLines($('statDue'), totals.byCurrency, 'due30');
+    statLines($('statYearly'), totals.byCurrency, 'yearly', true);
+    statLines($('statDue'), totals.byCurrency, 'due30', true);
     var active = $('statActive');
     active.textContent = '';
     var line = el('div', 'stat-line');
-    line.appendChild(el('span', 'stat-amount', String(totals.activeCount)));
+    var num = el('span', 'stat-amount');
+    line.appendChild(num);
     active.appendChild(line);
+    animateCount(num, totals.activeCount);
   }
+
+  /* ---------------- timeline (next 30 days) ---------------- */
+
+  function renderTimeline(today) {
+    var strip = $('timeline');
+    strip.textContent = '';
+    var charges = Core.upcomingCharges(items, today, 30).filter(function (c) {
+      return c.daysLeft >= 0;
+    });
+    $('timelineEmpty').hidden = charges.length > 0;
+    strip.hidden = charges.length === 0;
+    if (!charges.length) return;
+
+    var byDate = {};
+    charges.forEach(function (c) {
+      (byDate[c.date] || (byDate[c.date] = [])).push(c);
+    });
+
+    var track = el('div', 'timeline-track');
+    Object.keys(byDate)
+      .sort()
+      .forEach(function (date, idx) {
+        var dayCharges = byDate[date];
+        var daysLeft = dayCharges[0].daysLeft;
+        var biggest = dayCharges.slice().sort(function (a, b) {
+          return b.amount - a.amount;
+        })[0];
+        var marker = el('div', 'tl-marker' + (idx % 2 ? ' tl-alt' : ''));
+        var pct = Math.max(2, Math.min(98, (daysLeft / 30) * 100));
+        marker.style.left = pct + '%';
+        var dot = el('span', 'tl-dot');
+        dot.style.background = Core.categoryColor(biggest.category);
+        marker.appendChild(dot);
+        var totals = {};
+        dayCharges.forEach(function (c) {
+          totals[c.currency] = (totals[c.currency] || 0) + c.amount;
+        });
+        var totalText = Object.keys(totals)
+          .sort()
+          .map(function (cur) {
+            return fmtMoney(totals[cur], cur);
+          })
+          .join(' · ');
+        marker.appendChild(el('span', 'tl-amount', totalText));
+        marker.appendChild(el('span', 'tl-date', fmtDate(date)));
+        marker.title = dayCharges
+          .map(function (c) {
+            return c.name + ': ' + fmtMoney(c.amount, c.currency);
+          })
+          .join('\n');
+        track.appendChild(marker);
+      });
+    strip.appendChild(track);
+
+    var axis = el('div', 'tl-axis');
+    axis.appendChild(el('span', null, 'Today'));
+    axis.appendChild(el('span', null, '15 days'));
+    axis.appendChild(el('span', null, '30 days'));
+    strip.appendChild(axis);
+  }
+
+  /* ---------------- renewing soon and breakdown ---------------- */
 
   function renderSoon(today) {
     var list = $('soonList');
@@ -167,6 +346,7 @@
     entries.slice(0, 8).forEach(function (entry) {
       var item = entry.item;
       var row = el('li', 'soon-row');
+      row.appendChild(monogram(item));
       var main = el('div', 'soon-main');
       main.appendChild(el('div', 'soon-name', item.name));
       var meta = fmtDate(entry.date) + ' · ' + item.category;
@@ -204,21 +384,30 @@
     bars.textContent = '';
     $('breakdownEmpty').hidden = rows.length > 0;
     rows.forEach(function (row) {
+      var color = Core.categoryColor(row.category);
       var wrap = el('div', 'bar-row');
       var head = el('div', 'bar-head');
-      head.appendChild(el('span', null, row.category));
+      var label = el('span', 'bar-label');
+      var dot = el('span', 'cat-dot');
+      dot.style.background = color;
+      label.appendChild(dot);
+      label.appendChild(el('span', null, row.category));
+      head.appendChild(label);
       head.appendChild(
         el('span', 'bar-amount', fmtMoney(row.monthly, breakdownCurrency) + ' / mo · ' + Math.round(row.share) + '%')
       );
       var track = el('div', 'bar-track');
       var fill = el('div', 'bar-fill');
       fill.style.width = Math.max(2, Math.round(row.share)) + '%';
+      fill.style.background = color;
       track.appendChild(fill);
       wrap.appendChild(head);
       wrap.appendChild(track);
       bars.appendChild(wrap);
     });
   }
+
+  /* ---------------- upcoming charges ---------------- */
 
   function renderUpcoming(today) {
     var charges = Core.upcomingCharges(items, today, 90);
@@ -255,13 +444,20 @@
       groups[key].forEach(function (charge) {
         var row = el('div', 'charge-row');
         row.appendChild(el('span', 'charge-date', fmtDate(charge.date)));
-        row.appendChild(el('span', 'charge-name', charge.name));
+        var nameWrap = el('span', 'charge-name');
+        var dot = el('span', 'cat-dot');
+        dot.style.background = Core.categoryColor(charge.category);
+        nameWrap.appendChild(dot);
+        nameWrap.appendChild(el('span', null, charge.name));
+        row.appendChild(nameWrap);
         row.appendChild(el('span', 'charge-amount', fmtMoney(charge.amount, charge.currency)));
         group.appendChild(row);
       });
       container.appendChild(group);
     });
   }
+
+  /* ---------------- items list ---------------- */
 
   function renderItems(today) {
     var filtered = Core.filterItems(items, { query: searchQuery, category: activeCategory });
@@ -279,11 +475,21 @@
 
     sorted.forEach(function (item) {
       var row = el('li', 'item-row' + (item.status === 'paused' ? ' is-paused' : ''));
+      row.appendChild(monogram(item, 'monogram-lg'));
+
       var main = el('div', 'item-main');
       var top = el('div', 'item-top');
       top.appendChild(el('span', 'item-name', item.name));
-      top.appendChild(el('span', 'item-cat', item.category));
+      var catChip = el('span', 'item-cat');
+      var color = Core.categoryColor(item.category);
+      catChip.style.borderColor = color;
+      catChip.style.color = color;
+      catChip.textContent = item.category;
+      top.appendChild(catChip);
       if (item.status === 'paused') top.appendChild(el('span', 'item-paused-tag', 'Paused'));
+      if (priceNotes[item.id]) {
+        top.appendChild(el('span', 'price-tag', priceNotes[item.id]));
+      }
       main.appendChild(top);
 
       var next = Core.effectiveNext(item, today);
@@ -292,12 +498,44 @@
       if (item.paymentLabel) meta += ' · ' + item.paymentLabel;
       main.appendChild(el('div', 'item-meta', meta));
       if (item.notes) main.appendChild(el('div', 'item-notes', item.notes));
+
+      var history = Array.isArray(item.history) ? item.history : [];
+      var histBox = el('div', 'history-box');
+      histBox.hidden = !expandedHistory[item.id];
+      if (!history.length) {
+        histBox.appendChild(el('p', 'muted-note', 'No payments recorded yet. Use Mark renewed when this charge lands.'));
+      } else {
+        var hList = el('ul', 'history-list');
+        history.forEach(function (h) {
+          var hRow = el('li', 'history-row');
+          hRow.appendChild(el('span', null, fmtDate(h.date)));
+          hRow.appendChild(el('span', 'history-amount', fmtMoney(h.amount, item.currency)));
+          hList.appendChild(hRow);
+        });
+        histBox.appendChild(hList);
+      }
+      main.appendChild(histBox);
       row.appendChild(main);
 
       var side = el('div', 'item-side');
       side.appendChild(el('div', 'item-amount', fmtMoney(item.amount, item.currency)));
       side.appendChild(el('div', 'item-cycle', CYCLE_LABELS[item.cycle] || item.cycle));
       var actions = el('div', 'item-actions');
+      if (item.status === 'active') {
+        var renewBtn = el('button', 'btn btn-accent btn-small', 'Mark renewed');
+        renewBtn.type = 'button';
+        renewBtn.addEventListener('click', function () {
+          openRenew(item);
+        });
+        actions.appendChild(renewBtn);
+      }
+      var histBtn = el('button', 'btn btn-ghost btn-small', 'History (' + history.length + ')');
+      histBtn.type = 'button';
+      histBtn.addEventListener('click', function () {
+        expandedHistory[item.id] = !expandedHistory[item.id];
+        render();
+      });
+      actions.appendChild(histBtn);
       var editBtn = el('button', 'btn btn-ghost btn-small', 'Edit');
       editBtn.type = 'button';
       editBtn.addEventListener('click', function () {
@@ -310,6 +548,7 @@
           items = items.filter(function (i) {
             return i.id !== item.id;
           });
+          delete priceNotes[item.id];
           save();
           render();
         }
@@ -328,11 +567,35 @@
     ['All'].concat(Core.CATEGORIES).forEach(function (cat) {
       var chip = el('button', 'chip' + (cat === activeCategory ? ' active' : ''), cat);
       chip.type = 'button';
+      if (cat !== 'All') {
+        var dot = el('span', 'cat-dot');
+        dot.style.background = Core.categoryColor(cat);
+        chip.insertBefore(dot, chip.firstChild);
+      }
       chip.addEventListener('click', function () {
         activeCategory = cat;
         render();
       });
       row.appendChild(chip);
+    });
+  }
+
+  function buildQuickAdd(container) {
+    if (!container) return;
+    container.textContent = '';
+    Core.QUICK_ADD.forEach(function (preset) {
+      var chip = el('button', 'quick-chip');
+      chip.type = 'button';
+      var tile = el('span', 'monogram monogram-sm');
+      tile.textContent = preset.name.charAt(0).toUpperCase();
+      tile.style.background = Core.categoryColor(preset.category);
+      tile.setAttribute('aria-hidden', 'true');
+      chip.appendChild(tile);
+      chip.appendChild(el('span', null, preset.name));
+      chip.addEventListener('click', function () {
+        openModal(null, preset);
+      });
+      container.appendChild(chip);
     });
   }
 
@@ -342,7 +605,9 @@
     $('emptyState').hidden = hasItems;
     $('dashboard').hidden = !hasItems;
     if (!hasItems) return;
+    renderHero(today);
     renderStats(today);
+    renderTimeline(today);
     renderSoon(today);
     renderBreakdown();
     renderUpcoming(today);
@@ -350,7 +615,7 @@
     renderItems(today);
   }
 
-  /* ---------------- modal form ---------------- */
+  /* ---------------- item form modal ---------------- */
 
   function fillSelect(select, values, labels) {
     select.textContent = '';
@@ -361,12 +626,13 @@
     });
   }
 
-  function openModal(item) {
+  function openModal(item, preset) {
     var form = $('itemForm');
     form.reset();
     $('formErrors').hidden = true;
     $('fId').value = item ? item.id : '';
     $('formTitle').textContent = item ? 'Edit item' : 'Add item';
+    $('typicalHint').hidden = !preset;
     if (item) {
       $('fName').value = item.name;
       $('fAmount').value = item.amount;
@@ -378,11 +644,16 @@
       $('fPaymentLabel').value = item.paymentLabel || '';
       $('fNotes').value = item.notes || '';
     } else {
-      $('fCurrency').value = 'INR';
-      $('fCycle').value = 'monthly';
-      $('fCategory').value = 'Other';
+      $('fCurrency').value = preset ? preset.currency : 'INR';
+      $('fCycle').value = preset ? preset.cycle : 'monthly';
+      $('fCategory').value = preset ? preset.category : 'Other';
       $('fStatus').value = 'active';
       $('fNextDate').value = Core.todayStr();
+      if (preset) {
+        $('fName').value = preset.name;
+        $('fAmount').value = preset.amount;
+        $('fNextDate').value = Core.addCycle(Core.todayStr(), preset.cycle, 1);
+      }
     }
     $('modalOverlay').hidden = false;
     $('fName').focus();
@@ -394,6 +665,10 @@
 
   function onFormSubmit(event) {
     event.preventDefault();
+    var existingItem = null;
+    items.forEach(function (it) {
+      if (it.id === $('fId').value) existingItem = it;
+    });
     var input = {
       id: $('fId').value || undefined,
       name: $('fName').value,
@@ -404,7 +679,8 @@
       nextDate: $('fNextDate').value,
       status: $('fStatus').value,
       paymentLabel: $('fPaymentLabel').value,
-      notes: $('fNotes').value
+      notes: $('fNotes').value,
+      history: existingItem && Array.isArray(existingItem.history) ? existingItem.history : []
     };
     var result = Core.validateItem(input);
     var errorsBox = $('formErrors');
@@ -429,6 +705,229 @@
     render();
   }
 
+  /* ---------------- mark as renewed ---------------- */
+
+  function openRenew(item) {
+    renewTargetId = item.id;
+    $('renewItemName').textContent = item.name + ' · tracked at ' + fmtMoney(item.amount, item.currency) + ' ' + (CYCLE_LABELS[item.cycle] || '');
+    $('rDate').value = Core.todayStr();
+    $('rAmount').value = item.amount;
+    $('renewErrors').hidden = true;
+    $('renewOverlay').hidden = false;
+    $('rAmount').focus();
+  }
+
+  function closeRenew() {
+    $('renewOverlay').hidden = true;
+    renewTargetId = null;
+  }
+
+  function onRenewSubmit(event) {
+    event.preventDefault();
+    var item = null;
+    items.forEach(function (it) {
+      if (it.id === renewTargetId) item = it;
+    });
+    if (!item) {
+      closeRenew();
+      return;
+    }
+    var result = Core.markRenewed(
+      item,
+      { date: $('rDate').value, amount: $('rAmount').value },
+      Core.todayStr()
+    );
+    var errorsBox = $('renewErrors');
+    if (!result.ok) {
+      errorsBox.textContent = result.errors.join('\n');
+      errorsBox.hidden = false;
+      return;
+    }
+    items = items.map(function (it) {
+      return it.id === item.id ? result.item : it;
+    });
+    expandedHistory[item.id] = true;
+    var message = 'Recorded a payment of ' + fmtMoney(result.item.history[0].amount, item.currency) + ' for ' + item.name + '. Next renewal: ' + fmtDate(result.item.nextDate) + '.';
+    if (result.priceChanged) {
+      var note = 'Price changed: was ' + fmtMoney(result.previousAmount, item.currency) + ', now ' + fmtMoney(result.item.amount, item.currency);
+      priceNotes[item.id] = note;
+      message += ' ' + note + '. The tracked price has been updated.';
+    }
+    save();
+    closeRenew();
+    render();
+    showBanner(message, true);
+  }
+
+  /* ---------------- statement import ---------------- */
+
+  function guessCategory(proposal) {
+    var match = null;
+    Core.QUICK_ADD.forEach(function (preset) {
+      var key = Core.normalizeMerchant(preset.name);
+      if (key && (key === proposal.key || proposal.key.indexOf(key) !== -1)) match = preset;
+    });
+    return match ? match.category : 'Other';
+  }
+
+  function openReview(parsed, proposals) {
+    pendingProposals = proposals;
+    $('reviewSummary').textContent =
+      'Read ' + parsed.rowsRead + ' rows, used ' + parsed.rowsUsed + ' money-out rows, and found ' +
+      proposals.length + ' likely subscription' + (proposals.length === 1 ? '' : 's') +
+      '. Nothing is added until you confirm the selection below.';
+    $('reviewEmpty').hidden = proposals.length > 0;
+    $('reviewAddBtn').hidden = proposals.length === 0;
+    var list = $('proposalList');
+    list.textContent = '';
+    proposals.forEach(function (p, idx) {
+      var row = el('div', 'proposal');
+      var checkLabel = el('label', 'proposal-check');
+      var check = document.createElement('input');
+      check.type = 'checkbox';
+      check.checked = !p.alreadyTracked;
+      check.dataset.idx = String(idx);
+      check.className = 'p-check';
+      checkLabel.appendChild(check);
+      row.appendChild(checkLabel);
+
+      row.appendChild(monogram({ name: p.name, category: guessCategory(p) }));
+
+      var fields = el('div', 'proposal-fields');
+      var nameInput = document.createElement('input');
+      nameInput.type = 'text';
+      nameInput.className = 'p-name';
+      nameInput.value = p.name;
+      nameInput.maxLength = 80;
+      nameInput.setAttribute('aria-label', 'Name');
+      fields.appendChild(nameInput);
+      var meta = p.occurrences + ' charges · about every ' + p.avgGapDays + ' days · last charged ' + fmtDate(p.lastDate);
+      fields.appendChild(el('div', 'proposal-meta', meta));
+      if (p.alreadyTracked) {
+        fields.appendChild(el('span', 'tracked-tag', 'Already tracked'));
+      }
+      row.appendChild(fields);
+
+      var amountInput = document.createElement('input');
+      amountInput.type = 'number';
+      amountInput.className = 'p-amount';
+      amountInput.min = '0';
+      amountInput.step = '0.01';
+      amountInput.value = p.amount;
+      amountInput.setAttribute('aria-label', 'Amount');
+      row.appendChild(amountInput);
+
+      var cycleSelect = document.createElement('select');
+      cycleSelect.className = 'p-cycle';
+      cycleSelect.setAttribute('aria-label', 'Billing cycle');
+      Core.CYCLES.forEach(function (c) {
+        var opt = el('option', null, CYCLE_NAMES[c]);
+        opt.value = c;
+        if (c === p.cycle) opt.selected = true;
+        cycleSelect.appendChild(opt);
+      });
+      row.appendChild(cycleSelect);
+
+      var dateInput = document.createElement('input');
+      dateInput.type = 'date';
+      dateInput.className = 'p-date';
+      dateInput.value = p.nextDate;
+      dateInput.setAttribute('aria-label', 'Next renewal date');
+      row.appendChild(dateInput);
+
+      list.appendChild(row);
+    });
+    $('reviewOverlay').hidden = false;
+  }
+
+  function closeReview() {
+    $('reviewOverlay').hidden = true;
+    pendingProposals = [];
+  }
+
+  function onReviewAdd() {
+    var rows = $('proposalList').querySelectorAll('.proposal');
+    var added = 0;
+    var problems = [];
+    rows.forEach(function (row, idx) {
+      var check = row.querySelector('.p-check');
+      if (!check || !check.checked) return;
+      var p = pendingProposals[idx];
+      var result = Core.validateItem({
+        name: row.querySelector('.p-name').value,
+        amount: row.querySelector('.p-amount').value,
+        currency: p.currency,
+        cycle: row.querySelector('.p-cycle').value,
+        category: guessCategory(p),
+        nextDate: row.querySelector('.p-date').value,
+        status: 'active',
+        notes: 'Added from a bank statement import'
+      });
+      if (result.ok) {
+        items.push(result.value);
+        added += 1;
+      } else {
+        problems.push(p.name + ': ' + result.errors.join(' '));
+      }
+    });
+    if (problems.length) {
+      showBanner('Some subscriptions could not be added. ' + problems.join(' '), false);
+    }
+    if (added) {
+      save();
+      render();
+      showBanner('Added ' + added + ' subscription' + (added === 1 ? '' : 's') + ' from your statement.', true);
+    }
+    if (added || !problems.length) closeReview();
+  }
+
+  function handleStatementFile(file) {
+    if (!file) return;
+    file
+      .text()
+      .then(function (text) {
+        var parsed = Core.parseStatementCSV(text);
+        if (!parsed.ok) {
+          showBanner('Statement import failed: ' + parsed.error, false);
+          return;
+        }
+        var proposals = Core.detectRecurring(parsed.transactions, items);
+        openReview(parsed, proposals);
+      })
+      .catch(function () {
+        showBanner('Statement import failed: the file could not be read.', false);
+      });
+  }
+
+  /* ---------------- calendar export ---------------- */
+
+  function download(filename, content, type) {
+    var blob = new Blob([content], { type: type });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.setTimeout(function () {
+      URL.revokeObjectURL(url);
+    }, 1000);
+  }
+
+  function onCalendar() {
+    var hasActive = items.some(function (i) {
+      return i.status === 'active';
+    });
+    if (!hasActive) {
+      showBanner('No active items to put on a calendar yet. Add a subscription first.', false);
+      return;
+    }
+    var ics = Core.generateICS(items, Core.todayStr());
+    download('renewalradar-reminders.ics', ics, 'text/calendar');
+    showBanner('Calendar file downloaded. Import it into Google Calendar, Apple Calendar, or Outlook and each renewal will remind you 3 days ahead.', true);
+  }
+
   /* ---------------- data actions ---------------- */
 
   function onExport() {
@@ -438,17 +937,7 @@
       exportedAt: new Date().toISOString(),
       items: items
     };
-    var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement('a');
-    a.href = url;
-    a.download = 'renewalradar-export.json';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    window.setTimeout(function () {
-      URL.revokeObjectURL(url);
-    }, 1000);
+    download('renewalradar-export.json', JSON.stringify(payload, null, 2), 'application/json');
   }
 
   function onImportFile(event) {
@@ -499,6 +988,8 @@
     }
     items = [];
     breakdownCurrency = null;
+    priceNotes = {};
+    expandedHistory = {};
     save();
     render();
     showBanner('All data cleared.', true);
@@ -508,6 +999,7 @@
     if (items.length && !window.confirm('Load demo data? This replaces your current items.')) return;
     items = Core.demoItems(Core.todayStr());
     breakdownCurrency = null;
+    priceNotes = {};
     save();
     render();
     showBanner('Demo data loaded. The 7 demo items are fictional examples.', true);
@@ -519,6 +1011,8 @@
     fillSelect($('fCurrency'), Core.CURRENCIES);
     fillSelect($('fCycle'), Core.CYCLES, CYCLE_NAMES);
     fillSelect($('fCategory'), Core.CATEGORIES);
+    buildQuickAdd($('quickAddRow'));
+    buildQuickAdd($('quickAddEmpty'));
 
     $('addBtn').addEventListener('click', function () {
       openModal(null);
@@ -528,6 +1022,7 @@
     });
     $('demoBtn').addEventListener('click', onDemo);
     $('exportBtn').addEventListener('click', onExport);
+    $('calendarBtn').addEventListener('click', onCalendar);
     $('importFile').addEventListener('change', onImportFile);
     $('clearBtn').addEventListener('click', onClear);
     $('cancelBtn').addEventListener('click', closeModal);
@@ -535,9 +1030,56 @@
     $('modalOverlay').addEventListener('click', function (event) {
       if (event.target === $('modalOverlay')) closeModal();
     });
-    document.addEventListener('keydown', function (event) {
-      if (event.key === 'Escape' && !$('modalOverlay').hidden) closeModal();
+    $('renewForm').addEventListener('submit', onRenewSubmit);
+    $('renewCancelBtn').addEventListener('click', closeRenew);
+    $('renewOverlay').addEventListener('click', function (event) {
+      if (event.target === $('renewOverlay')) closeRenew();
     });
+    $('reviewCancelBtn').addEventListener('click', closeReview);
+    $('reviewAddBtn').addEventListener('click', onReviewAdd);
+    $('reviewOverlay').addEventListener('click', function (event) {
+      if (event.target === $('reviewOverlay')) closeReview();
+    });
+    document.addEventListener('keydown', function (event) {
+      if (event.key !== 'Escape') return;
+      if (!$('modalOverlay').hidden) closeModal();
+      if (!$('renewOverlay').hidden) closeRenew();
+      if (!$('reviewOverlay').hidden) closeReview();
+    });
+
+    var dropZone = $('dropZone');
+    var statementFile = $('statementFile');
+    dropZone.addEventListener('click', function () {
+      statementFile.click();
+    });
+    dropZone.addEventListener('keydown', function (event) {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        statementFile.click();
+      }
+    });
+    statementFile.addEventListener('change', function (event) {
+      var file = event.target.files && event.target.files[0];
+      event.target.value = '';
+      handleStatementFile(file);
+    });
+    ['dragenter', 'dragover'].forEach(function (name) {
+      dropZone.addEventListener(name, function (event) {
+        event.preventDefault();
+        dropZone.classList.add('dragging');
+      });
+    });
+    ['dragleave', 'drop'].forEach(function (name) {
+      dropZone.addEventListener(name, function (event) {
+        event.preventDefault();
+        dropZone.classList.remove('dragging');
+      });
+    });
+    dropZone.addEventListener('drop', function (event) {
+      var file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
+      handleStatementFile(file);
+    });
+
     $('searchInput').addEventListener('input', function (event) {
       searchQuery = event.target.value;
       renderItems(Core.todayStr());
