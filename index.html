@@ -24,6 +24,7 @@
       </div>
     </div>
     <div class="header-actions">
+      <button id="calendarBtn" class="btn btn-ghost" type="button">Calendar (.ics)</button>
       <button id="exportBtn" class="btn btn-ghost" type="button">Export JSON</button>
       <label class="btn btn-ghost file-label" for="importFile">Import JSON</label>
       <input id="importFile" type="file" accept="application/json,.json" hidden>
@@ -37,20 +38,29 @@
 
   <section id="emptyState" class="empty" hidden>
     <h2>No subscriptions tracked yet</h2>
-    <p>Add your first renewal, or load the demo data to see how RenewalRadar works. The demo items are fictional examples and you can clear them at any time.</p>
+    <p>Add your first renewal, load the demo data, or pick a common service below to see how RenewalRadar works. The demo items are fictional examples and you can clear them at any time.</p>
     <div class="empty-actions">
       <button id="demoBtn" class="btn btn-accent" type="button">Load demo data</button>
       <button id="emptyAddBtn" class="btn btn-ghost" type="button">Add your first item</button>
     </div>
+    <h3 class="quick-title">Quick add a service</h3>
+    <div id="quickAddEmpty" class="quick-row"></div>
   </section>
 
   <div id="dashboard" hidden>
-    <section class="stats" aria-label="Summary">
-      <article class="card stat">
+    <section class="hero" aria-label="Monthly burn summary">
+      <div class="hero-main">
         <h2>Monthly burn</h2>
-        <div id="statMonthly" class="stat-values"></div>
-        <p class="stat-note">Recurring cost, normalized to one month</p>
-      </article>
+        <div id="heroMonthly" class="hero-values"></div>
+        <p class="hero-note">Recurring cost, normalized to one month</p>
+      </div>
+      <div class="hero-spot">
+        <h2>Next charge</h2>
+        <div id="heroSpotlight"></div>
+      </div>
+    </section>
+
+    <section class="stats" aria-label="Summary">
       <article class="card stat">
         <h2>Yearly cost</h2>
         <div id="statYearly" class="stat-values"></div>
@@ -66,6 +76,13 @@
         <div id="statDue" class="stat-values"></div>
         <p class="stat-note">Actual charges projected in the window</p>
       </article>
+    </section>
+
+    <section class="card" aria-labelledby="timelineTitle">
+      <h2 id="timelineTitle" class="card-title">Next 30 days</h2>
+      <p class="muted-note">Every projected charge, day by day. Marker colors match the category colors used across the app.</p>
+      <div id="timeline" class="timeline"></div>
+      <p id="timelineEmpty" class="muted-note" hidden>Nothing is due in the next 30 days.</p>
     </section>
 
     <div class="grid-2">
@@ -95,6 +112,16 @@
       <p id="upcomingEmpty" class="muted-note" hidden>Nothing is due in the next 90 days.</p>
     </section>
 
+    <section class="card" aria-labelledby="importTitle">
+      <h2 id="importTitle" class="card-title">Find subscriptions in a bank statement</h2>
+      <p class="muted-note">Drop a statement CSV export from your bank (HDFC, SBI, ICICI, Axis, and similar shapes work). RenewalRadar reads it right here in your browser, looks for charges that repeat on a weekly, monthly, quarterly, half-yearly, or yearly rhythm, and asks you to confirm before adding anything. The file never leaves this device.</p>
+      <div id="dropZone" class="dropzone" tabindex="0" role="button" aria-label="Import a bank statement CSV">
+        <p class="dropzone-title">Drop a .csv statement here, or click to choose the file</p>
+        <p class="dropzone-sub">Detection needs at least 2 past charges per subscription.</p>
+      </div>
+      <input id="statementFile" type="file" accept=".csv,text/csv" hidden>
+    </section>
+
     <section class="card" aria-labelledby="itemsTitle">
       <div class="card-head">
         <h2 id="itemsTitle" class="card-title">All items</h2>
@@ -102,13 +129,15 @@
           <input id="searchInput" type="search" placeholder="Name, payment method, note..." autocomplete="off">
         </label>
       </div>
+      <h3 class="quick-title">Quick add a service</h3>
+      <div id="quickAddRow" class="quick-row"></div>
       <div id="chipRow" class="chips" role="group" aria-label="Filter by category"></div>
       <ul id="itemsList" class="items-list"></ul>
       <p id="itemsEmpty" class="muted-note" hidden>No items match your search or filter.</p>
     </section>
 
     <section class="data-bar">
-      <p>Your data is stored only in this browser (localStorage). Export a JSON backup before switching devices or clearing site data.</p>
+      <p>Your data is stored only in this browser (localStorage). Export a JSON backup before switching devices or clearing site data. Use Calendar (.ics) to get renewal reminders in your own calendar app: there is no server and no background process.</p>
       <button id="clearBtn" class="btn btn-danger" type="button">Clear all data</button>
     </section>
   </div>
@@ -123,6 +152,7 @@
 <div id="modalOverlay" class="overlay" hidden>
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="formTitle">
     <h2 id="formTitle">Add item</h2>
+    <p id="typicalHint" class="typical-hint" hidden>Typical price shown, change it to what you actually pay.</p>
     <form id="itemForm" novalidate>
       <input type="hidden" id="fId">
       <div class="form-grid">
@@ -163,6 +193,42 @@
         <button type="submit" class="btn btn-accent">Save item</button>
       </div>
     </form>
+  </div>
+</div>
+
+<div id="renewOverlay" class="overlay" hidden>
+  <div class="modal modal-small" role="dialog" aria-modal="true" aria-labelledby="renewTitle">
+    <h2 id="renewTitle">Mark as renewed</h2>
+    <p id="renewItemName" class="renew-name"></p>
+    <form id="renewForm" novalidate>
+      <div class="form-grid">
+        <label class="field" for="rDate">Payment date
+          <input id="rDate" type="date" required>
+        </label>
+        <label class="field" for="rAmount">Amount paid
+          <input id="rAmount" type="number" min="0" step="0.01" inputmode="decimal" required>
+        </label>
+      </div>
+      <p class="muted-note">The payment is saved to the item history, the next renewal rolls forward, and if the amount differs from the tracked price, the tracked price is updated.</p>
+      <div id="renewErrors" class="form-errors" role="alert" hidden></div>
+      <div class="form-actions">
+        <button type="button" id="renewCancelBtn" class="btn btn-ghost">Cancel</button>
+        <button type="submit" class="btn btn-accent">Save payment</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div id="reviewOverlay" class="overlay" hidden>
+  <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="reviewTitle">
+    <h2 id="reviewTitle">Likely subscriptions in your statement</h2>
+    <p id="reviewSummary" class="muted-note"></p>
+    <div id="proposalList" class="proposals"></div>
+    <p id="reviewEmpty" class="muted-note" hidden>No repeating charges were found. Detection needs at least 2 charges for the same merchant, at a similar amount, on a weekly, monthly, quarterly, half-yearly, or yearly rhythm.</p>
+    <div class="form-actions">
+      <button type="button" id="reviewCancelBtn" class="btn btn-ghost">Cancel</button>
+      <button type="button" id="reviewAddBtn" class="btn btn-accent">Add selected</button>
+    </div>
   </div>
 </div>
 
