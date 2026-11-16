@@ -1,0 +1,1 @@
+{"author":"Rahil Sahu","description":"Local-first subscription and bill tracker: see your monthly burn and never get surprised by a renewal again.","engines":{"node":">=20"},"license":"MIT","name":"renewalradar","private":true,"scripts":{"test":"node --test"},"version":"1.0.0"}
